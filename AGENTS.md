@@ -9,7 +9,7 @@ The project is split into simple modules:
 ```text
 main.py        CLI entry point
 pdf_opener.py  Opens PDFs and renders pages as images
-ocr.py         Runs EasyOCR on page images
+ocr.py         Runs the selected OCR backend on page images
 pdf_writer.py  Writes recognized text into a new PDF
 ```
 
@@ -18,22 +18,36 @@ PyMuPDF is used for both sides of PDF work:
 - rendering scanned source pages for OCR
 - creating the final text PDF
 
-EasyOCR is isolated in `ocr.py` so another OCR backend can be added later without rewriting the whole pipeline.
+OCR backend details are isolated in `ocr.py` so the rest of the pipeline can stay unchanged.
 
-`ocr.py` uses a small `OCRReader` class to cache the expensive EasyOCR reader instance without module-level mutable globals. Keep that class narrow.
+`OCRReader` should default to `unlimited-ocr` using `baidu/Unlimited-OCR` from Hugging Face. Keep EasyOCR available as the fallback backend via `--ocr-backend easyocr`.
 
-`OCRReader` should default to `gpu=True`. In EasyOCR 1.7.2 this tries CUDA first, then Apple MPS, then falls back to CPU with a warning if neither backend is available.
+`ocr.py` uses a small `OCRReader` class to cache the expensive OCR model/reader instance without module-level mutable globals. Keep that class narrow.
+
+Unlimited-OCR should use its multi-page `infer_multi()` path for batches larger than one page. The CLI default batch size is 4 pages; keep that conservative unless the user asks to tune for a specific GPU.
+
+Unlimited-OCR uses 2 worker processes by default on this machine so the RTX 5090 is fed by two model instances. Each worker loads its own model copy, so reduce to `--ocr-workers 1` if VRAM gets tight.
+
+`OCRReader` should default to `gpu=True`. Unlimited-OCR currently requires CUDA in its Hugging Face implementation. In EasyOCR 1.7.2, `gpu=True` tries CUDA first, then Apple MPS, then falls back to CPU with a warning if neither backend is available.
 
 ## Local Setup Notes
 
-The user's current venv was created with:
+Create the local venv normally:
 
 ```bash
-python3 -m venv --system-site-packages .venv
+python -m venv .venv
 ```
 
-That was intentional because EasyOCR and related ML dependencies were already available in the system Python environment, and the user wanted to avoid unnecessary traffic and large downloads.
+Keep dependencies installed inside `.venv`. Avoid relying on system or user site-packages for OCR/PyTorch because mixed PyTorch environments are fragile.
 
-PyMuPDF was the only missing dependency during initial setup and was installed into `.venv`.
+## OCR Comparison Notes
 
-Avoid reinstalling EasyOCR, PyTorch, or OCR models unless the user explicitly asks. EasyOCR may download the English recognition model on first real OCR use if it is not cached locally.
+`compare_ocr.py` tests OCR backends on selected pages and writes ignored outputs under `ocr_comparison/`.
+
+Keep the main `.venv` on Transformers 4.57.1 for Unlimited-OCR compatibility. PaddleOCR-VL and NuExtract3 need Transformers v5, so the comparison script uses the ignored `.ocr_vendor/transformers5` target directory for only those worker subprocesses. Recreate it with:
+
+```bash
+python -m pip install --target ./.ocr_vendor/transformers5 -r requirements-ocr-transformers5.txt
+```
+
+Surya OCR 2 uses llama.cpp on Windows when `.ocr_vendor/llama.cpp/b9843/llama-server.exe` exists. Without that binary it may try Docker/vLLM and fail if Docker Desktop's Linux engine is not running.

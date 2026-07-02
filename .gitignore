@@ -4,3 +4,5 @@ __pycache__/
 .DS_Store
 *_text.pdf
 Scanned/
+ocr_comparison/
+.ocr_vendor/

@@ -21,17 +21,18 @@ The first version focuses on a simple, working OCR pipeline:
 
 The code should stay direct and practical: no unnecessary classes, no framework structure, and no abstractions until they are useful.
 
-## Initial OCR Choice
+## OCR Choice
 
-Use EasyOCR with English recognition for the first implementation.
+Use Unlimited-OCR as the default backend, with EasyOCR kept as a fallback backend.
 
 Constraints:
 
-- Do not download large OCR models.
-- Use only the EasyOCR English model for the initial version.
-- Keep the OCR reader isolated so another OCR backend can be added later without rewriting the whole pipeline.
+- Keep the OCR reader isolated so backend changes do not rewrite the whole pipeline.
+- Use the Unlimited-OCR multi-page path for page batches when possible.
+- Use multiple Unlimited-OCR worker processes when requested or by default on the RTX 5090 machine; each worker loads one model copy.
+- Keep EasyOCR English recognition available through `--ocr-backend easyocr`.
 
-Note: EasyOCR may download its language model on first use if it is not already cached locally. The program should document this clearly and avoid requesting extra languages by default.
+Note: Unlimited-OCR downloads `baidu/Unlimited-OCR` from Hugging Face on first use if it is not cached locally. EasyOCR may download its language model on first use if it is not already cached locally.
 
 ## Proposed File Structure
 
@@ -77,8 +78,9 @@ OCR backend module.
 
 Responsibilities:
 
-- Create the EasyOCR reader with English only.
-- Default to EasyOCR `gpu=True`; EasyOCR uses CUDA or Apple MPS when available and falls back to CPU otherwise.
+- Default to Unlimited-OCR with CUDA.
+- Use EasyOCR with English only when `--ocr-backend easyocr` is selected.
+- Default to `gpu=True`.
 - Keep the EasyOCR reader cached inside a small reader object, not a module-level global.
 - Provide one simple method, for example:
 
@@ -88,9 +90,9 @@ def read_text_from_page(self, image) -> str:
 ```
 
 - Return plain recognized text for a page.
-- Hide EasyOCR-specific details from the rest of the program.
+- Hide OCR-backend-specific details from the rest of the program.
 
-Future OCR backends can be added by replacing or extending this module while keeping the same method shape.
+Future OCR backends can be added by extending this module while keeping the same method shape.
 
 ### `pdf_writer.py`
 
