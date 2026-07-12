@@ -21,17 +21,18 @@ The first version focuses on a simple, working OCR pipeline:
 
 The code should stay direct and practical: no unnecessary classes, no framework structure, and no abstractions until they are useful.
 
-## Initial OCR Choice
+## OCR Choice
 
-Use EasyOCR with English recognition for the first implementation.
+Use Unlimited-OCR as the default backend, with EasyOCR kept as a fallback backend.
 
 Constraints:
 
-- Do not download large OCR models.
-- Use only the EasyOCR English model for the initial version.
-- Keep the OCR reader isolated so another OCR backend can be added later without rewriting the whole pipeline.
+- Keep the OCR reader isolated so backend changes do not rewrite the whole pipeline.
+- Use the Unlimited-OCR multi-page path for page batches when possible.
+- Use multiple Unlimited-OCR worker processes when requested or by default on the RTX 5090 machine; each worker loads one model copy.
+- Keep EasyOCR English recognition available through `--ocr-backend easyocr`.
 
-Note: EasyOCR may download its language model on first use if it is not already cached locally. The program should document this clearly and avoid requesting extra languages by default.
+Note: Unlimited-OCR downloads `baidu/Unlimited-OCR` from Hugging Face on first use if it is not cached locally. EasyOCR may download its language model on first use if it is not already cached locally.
 
 ## Proposed File Structure
 
@@ -40,6 +41,7 @@ BookScribe/
   main.py
   pdf_opener.py
   ocr.py
+  font_classification.py  Classifies source text crops as regular/bold/italic/bold-italic
   pdf_writer.py
   PROJECT_SPEC.md
   requirements.txt
@@ -77,8 +79,9 @@ OCR backend module.
 
 Responsibilities:
 
-- Create the EasyOCR reader with English only.
-- Default to EasyOCR `gpu=True`; EasyOCR uses CUDA or Apple MPS when available and falls back to CPU otherwise.
+- Default to Unlimited-OCR with CUDA.
+- Use EasyOCR with English only when `--ocr-backend easyocr` is selected.
+- Default to `gpu=True`.
 - Keep the EasyOCR reader cached inside a small reader object, not a module-level global.
 - Provide one simple method, for example:
 
@@ -88,9 +91,9 @@ def read_text_from_page(self, image) -> str:
 ```
 
 - Return plain recognized text for a page.
-- Hide EasyOCR-specific details from the rest of the program.
+- Hide OCR-backend-specific details from the rest of the program.
 
-Future OCR backends can be added by replacing or extending this module while keeping the same method shape.
+Future OCR backends can be added by extending this module while keeping the same method shape.
 
 ### `pdf_writer.py`
 
@@ -99,11 +102,25 @@ Text PDF creation.
 Responsibilities:
 
 - Create a new PDF containing selectable text.
-- Add one output page per source page.
-- Write OCR text with readable margins and font size.
-- Handle long text by wrapping lines and continuing onto additional pages if needed.
+- For Unlimited-OCR, use detected text and image coordinates to place text and cropped image regions.
+- Segment source lines into words and use `font_classification.py` to choose regular, bold, italic, or bold-italic style for each word.
+- Preserve source line positions and render adjacent words as selectable styled text.
+- Preserve source line widths through source-derived interword spacing instead of reflowing paragraphs.
+- Retain image-heavy or structurally complex source pages as raster pages with an invisible OCR layer when OCR tokens cannot reproduce their visible layout.
+- Keep EasyOCR as a plain text fallback.
 
 Library: PyMuPDF (`fitz`). Use it to create a new PDF, add pages, and insert OCR text directly.
+
+### `font_classification.py`
+
+Font-style classification.
+
+Responsibilities:
+
+- Train a small local CNN from installed serif book-font words and cache the weights after the first run.
+- Predict bold and italic as independent word attributes, then calibrate them from page-relative slant and stroke evidence.
+- Classify source word crops as regular, bold, italic, or bold-italic.
+- Avoid regex-based attribution or author styling.
 
 ## Output Behavior
 

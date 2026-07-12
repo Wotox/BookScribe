@@ -1,3 +1,18 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+transformers==4.57.1
+accelerate
+addict==2.4.0
+easydict==1.13
+einops==0.8.2
+matplotlib==3.10.8
+requests
+tqdm
+surya-ocr
 easyocr
+opencv-python-headless
 PyMuPDF
+Pillow
 numpy
