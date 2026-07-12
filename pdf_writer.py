@@ -1,4 +1,5 @@
 import io
+import math
 from pathlib import Path
 import textwrap
 
@@ -16,6 +17,7 @@ FONT_SIZE = 11
 LINE_HEIGHT = 15
 MAX_CHARS_PER_LINE = 86
 COORD_SIZE = 1000
+ALIGNMENT_FONT = fitz.Font("tiro")
 
 
 def write_text_pdf(page_texts, output_path):
@@ -110,7 +112,12 @@ def _parse_detection_metadata(metadata):
 def _add_unlimited_ocr_blocks(page, page_result, blocks, font_classifier):
     with Image.open(page_result["image_path"]) as image:
         source_image = image.convert("RGB")
+        if _should_preserve_source_page(source_image, blocks):
+            page.insert_image(page.rect, stream=_image_bytes(source_image))
+            _insert_invisible_text_blocks(page, blocks)
+            return
 
+        entries = []
         for block in blocks:
             rect = _scale_bbox(block["bbox"], page.rect)
             if rect.is_empty or rect.width <= 1 or rect.height <= 1:
@@ -118,7 +125,7 @@ def _add_unlimited_ocr_blocks(page, page_result, blocks, font_classifier):
 
             if block["kind"] == "image":
                 crop = _crop_source_region(source_image, block["bbox"])
-                page.insert_image(rect, stream=_image_bytes(crop))
+                entries.append({"kind": "image", "rect": rect, "crop": crop})
                 continue
 
             text = block["text"].strip()
@@ -126,62 +133,523 @@ def _add_unlimited_ocr_blocks(page, page_result, blocks, font_classifier):
                 continue
 
             crop = _crop_source_region(source_image, block["bbox"])
-            _insert_classified_text(page, rect, text, crop, block["kind"], font_classifier)
+            layout = _source_text_layout(crop, text)
+            entries.append(
+                {
+                    "kind": block["kind"],
+                    "rect": rect,
+                    "crop": crop,
+                    "text": text,
+                    "layout": layout,
+                }
+            )
+
+        text_entries = [entry for entry in entries if entry["kind"] != "image"]
+        word_groups = [
+            [word["crop"] for line in entry["layout"] for word in line["words"]]
+            if entry["layout"] is not None
+            else []
+            for entry in text_entries
+        ]
+        choices = font_classifier.classify_word_groups(
+            word_groups,
+            [entry["kind"] for entry in text_entries],
+        )
+        for entry, entry_choices in zip(text_entries, choices):
+            if entry["layout"] is None:
+                continue
+
+            choice_index = 0
+            for line in entry["layout"]:
+                for word in line["words"]:
+                    word["choice"] = entry_choices[choice_index]
+                    choice_index += 1
+
+        body_font_size = _page_body_font_size(text_entries, font_classifier)
+
+        for entry in entries:
+            if entry["kind"] == "image":
+                page.insert_image(entry["rect"], stream=_image_bytes(entry["crop"]))
+            elif entry["layout"] is None:
+                _insert_text_fallback(
+                    page,
+                    entry["rect"],
+                    entry["text"],
+                    entry["crop"],
+                    entry["kind"],
+                    font_classifier,
+                )
+            else:
+                _insert_source_layout(
+                    page,
+                    entry["rect"],
+                    entry["crop"],
+                    entry["layout"],
+                    entry["kind"],
+                    font_classifier,
+                    body_font_size,
+                )
 
 
-def _insert_classified_text(page, rect, text, crop, kind, font_classifier):
+def _should_preserve_source_page(source_image, blocks):
+    word_count = sum(
+        len(block["text"].split())
+        for block in blocks
+        if block["kind"] != "image"
+    )
+
+    array = np.asarray(source_image, dtype=np.int16)
+    channel_range = array.max(axis=2) - array.min(axis=2)
+    colorful_fraction = float((channel_range > 25).mean())
+    if word_count <= 20 and colorful_fraction > 0.2:
+        return True
+
+    image_fraction = sum(
+        max(0.0, block["bbox"][2] - block["bbox"][0])
+        * max(0.0, block["bbox"][3] - block["bbox"][1])
+        / (COORD_SIZE * COORD_SIZE)
+        for block in blocks
+        if block["kind"] == "image"
+    )
+    if word_count <= 100 and image_fraction >= 0.25:
+        return True
+
+    short_wide_lines = sum(
+        1
+        for block in blocks
+        if block["kind"] == "text"
+        and block["bbox"][2] - block["bbox"][0] >= COORD_SIZE * 0.6
+        and 2 <= len(block["text"].split()) <= 12
+    )
+    return short_wide_lines >= 6
+
+
+def _insert_invisible_text_blocks(page, blocks):
+    for block in blocks:
+        text = block["text"].strip()
+        if block["kind"] == "image" or not text:
+            continue
+
+        rect = _scale_bbox(block["bbox"], page.rect)
+        font_size = max(4.0, min(12.0, rect.height * 0.45))
+        page.insert_textbox(
+            rect,
+            text,
+            fontsize=font_size,
+            fontname="helv",
+            render_mode=3,
+        )
+
+
+def _source_text_layout(crop, text):
+    tokens = text.split()
+    if not tokens:
+        return []
+
+    ink, lines = _source_line_regions(crop)
+    if not lines:
+        return None
+
+    target_counts = _target_line_word_counts(lines, tokens)
+    if target_counts is None:
+        return None
+
+    token_index = 0
+    for line, target_count in zip(lines, target_counts):
+        line_tokens = tokens[token_index : token_index + target_count]
+        token_index += target_count
+        word_bands = _word_bands_for_tokens(line["glyph_bands"], line_tokens)
+        if len(word_bands) != len(line_tokens):
+            return None
+
+        line["left"] = word_bands[0][0]
+        line["right"] = word_bands[-1][1]
+        line["words"] = []
+        for token, (left, right) in zip(line_tokens, word_bands):
+            padding = 2
+            word_crop = crop.crop(
+                (
+                    max(0, left - padding),
+                    max(0, line["top"] - padding),
+                    min(crop.width, right + padding),
+                    min(crop.height, line["bottom"] + padding),
+                )
+            )
+            line["words"].append(
+                {
+                    "text": token,
+                    "left": left,
+                    "right": right,
+                    "crop": word_crop,
+                }
+            )
+
+    if token_index != len(tokens):
+        return None
+
+    return lines
+
+
+def _source_line_regions(crop):
+    gray = ImageOps.autocontrast(ImageOps.grayscale(crop))
+    array = np.asarray(gray, dtype=np.uint8)
+    threshold = min(235, max(35, int(array.mean() - array.std() * 0.15)))
+    ink = array < threshold
+    row_counts = ink.sum(axis=1)
+    if not len(row_counts) or int(row_counts.max()) <= 0:
+        return ink, []
+
+    active = row_counts > max(2, row_counts.max() * 0.08)
+    bands = _merge_line_fragments(_axis_bands(active), max_gap=3)
+    lines = []
+
+    for top, bottom in bands:
+        if bottom - top < 2:
+            continue
+
+        columns = ink[top:bottom].sum(axis=0) > 0
+        glyph_bands = _axis_bands(columns)
+        if not glyph_bands:
+            continue
+
+        word_gap = max(3, int(round((bottom - top) * 0.18)))
+        initial_words = _merge_close_bands(glyph_bands, word_gap)
+        lines.append(
+            {
+                "top": top,
+                "bottom": bottom,
+                "glyph_bands": glyph_bands,
+                "initial_count": len(initial_words),
+            }
+        )
+
+    return ink, lines
+
+
+def _target_line_word_counts(lines, tokens):
+    counts = [line["initial_count"] for line in lines]
+    difference = len(tokens) - sum(counts)
+
+    while difference > 0:
+        candidates = []
+        for index, (line, count) in enumerate(zip(lines, counts)):
+            gaps = _sorted_gaps(line["glyph_bands"])
+            next_gap = gaps[count - 1][0] if count - 1 < len(gaps) else -1
+            candidates.append((next_gap, -index, index))
+
+        next_gap, _negative_index, index = max(candidates)
+        if next_gap < 0:
+            return None
+        counts[index] += 1
+        difference -= 1
+
+    while difference < 0:
+        candidates = []
+        for index, (line, count) in enumerate(zip(lines, counts)):
+            if count <= 1:
+                continue
+            gaps = _sorted_gaps(line["glyph_bands"])
+            weakest_gap = gaps[count - 2][0]
+            candidates.append((weakest_gap, index))
+
+        if not candidates:
+            return None
+        _weakest_gap, index = min(candidates)
+        counts[index] -= 1
+        difference += 1
+
+    return _optimize_line_word_counts(lines, tokens, counts)
+
+
+def _optimize_line_word_counts(lines, tokens, counts):
+    counts = list(counts)
+    current_cost = _line_alignment_cost(lines, tokens, counts)
+    ratios = _line_alignment_ratios(lines, tokens, counts)
+    target_ratio = float(np.median(ratios))
+    candidate = _line_counts_for_scale(lines, tokens, target_ratio)
+    candidate_cost = _line_alignment_cost(lines, tokens, candidate)
+    return candidate if current_cost - candidate_cost >= 0.01 else counts
+
+
+def _line_counts_for_scale(lines, tokens, target_ratio):
+    state = {(0, 0): (0.0, [])}
+    line_count = len(lines)
+
+    for line_index, line in enumerate(lines):
+        next_state = {}
+        initial_count = line["initial_count"]
+        observed_width = line["glyph_bands"][-1][1] - line["glyph_bands"][0][0]
+
+        for (_processed_lines, token_index), (cost, counts) in state.items():
+            remaining_lines = line_count - line_index - 1
+            maximum_count = min(
+                len(line["glyph_bands"]),
+                initial_count + 5,
+                len(tokens) - token_index - remaining_lines,
+            )
+            for count in range(max(1, initial_count - 5), maximum_count + 1):
+                text = " ".join(tokens[token_index : token_index + count])
+                measured_width = ALIGNMENT_FONT.text_length(text, fontsize=1.0)
+                ratio = observed_width / max(measured_width, 1e-6)
+                line_cost = math.log(ratio / target_ratio) ** 2
+                line_cost += 0.0005 * (count - initial_count) ** 2
+                key = (line_index + 1, token_index + count)
+                candidate = (cost + line_cost, counts + [count])
+                if key not in next_state or candidate[0] < next_state[key][0]:
+                    next_state[key] = candidate
+
+        state = next_state
+
+    result = state.get((line_count, len(tokens)))
+    return result[1] if result is not None else [line["initial_count"] for line in lines]
+
+
+def _line_alignment_cost(lines, tokens, counts):
+    ratios = _line_alignment_ratios(lines, tokens, counts)
+    return float(ratios.std() / max(ratios.mean(), 1e-6))
+
+
+def _line_alignment_ratios(lines, tokens, counts):
+    ratios = []
+    token_index = 0
+
+    for line, count in zip(lines, counts):
+        line_text = " ".join(tokens[token_index : token_index + count])
+        token_index += count
+        measured_width = ALIGNMENT_FONT.text_length(line_text, fontsize=1.0)
+        observed_width = line["glyph_bands"][-1][1] - line["glyph_bands"][0][0]
+        ratios.append(observed_width / max(measured_width, 1e-6))
+
+    return np.asarray(ratios, dtype=np.float32)
+
+
+def _word_bands_for_tokens(glyph_bands, tokens):
+    word_count = len(tokens)
+    if word_count < 1 or word_count > len(glyph_bands):
+        return []
+
+    line_span = glyph_bands[-1][1] - glyph_bands[0][0]
+    measured_line = ALIGNMENT_FONT.text_length(" ".join(tokens), fontsize=1.0)
+    scale = line_span / max(measured_line, 1e-6)
+    state = {(0, 0): (0.0, [])}
+
+    for token_index, token in enumerate(tokens):
+        next_state = {}
+        remaining_tokens = word_count - token_index - 1
+        expected_width = max(
+            ALIGNMENT_FONT.text_length(token, fontsize=1.0) * scale,
+            1.0,
+        )
+
+        for (_processed_tokens, start), (cost, words) in state.items():
+            maximum_end = len(glyph_bands) - remaining_tokens
+            for end in range(start + 1, maximum_end + 1):
+                observed_width = glyph_bands[end - 1][1] - glyph_bands[start][0]
+                candidate_cost = cost + math.log(observed_width / expected_width) ** 2
+                if end < len(glyph_bands):
+                    gap = glyph_bands[end][0] - glyph_bands[end - 1][1]
+                    candidate_cost -= min(gap, 12) * 0.015
+
+                key = (token_index + 1, end)
+                candidate = (
+                    candidate_cost,
+                    words + [(glyph_bands[start][0], glyph_bands[end - 1][1])],
+                )
+                if key not in next_state or candidate_cost < next_state[key][0]:
+                    next_state[key] = candidate
+
+        state = next_state
+
+    result = state.get((word_count, len(glyph_bands)))
+    return result[1] if result is not None else []
+
+
+def _sorted_gaps(bands):
+    return sorted(
+        [
+            (bands[index + 1][0] - bands[index][1], index)
+            for index in range(len(bands) - 1)
+        ],
+        reverse=True,
+    )
+
+
+def _axis_bands(active):
+    bands = []
+    start = None
+
+    for index, value in enumerate(active):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            bands.append((start, index))
+            start = None
+
+    if start is not None:
+        bands.append((start, len(active)))
+
+    return bands
+
+
+def _merge_close_bands(bands, max_gap):
+    merged = []
+    for band in bands:
+        if merged and band[0] - merged[-1][1] <= max_gap:
+            merged[-1] = (merged[-1][0], band[1])
+        else:
+            merged.append(band)
+    return merged
+
+
+def _merge_line_fragments(bands, max_gap):
+    merged = []
+    for band in bands:
+        previous_height = merged[-1][1] - merged[-1][0] if merged else 0
+        band_height = band[1] - band[0]
+        is_fragment = min(previous_height, band_height) <= 3
+        if merged and band[0] - merged[-1][1] <= max_gap and is_fragment:
+            merged[-1] = (merged[-1][0], band[1])
+        else:
+            merged.append(band)
+    return merged
+
+
+def _page_body_font_size(text_entries, font_classifier):
+    sizes = []
+    for entry in text_entries:
+        if entry["kind"] != "text" or entry["layout"] is None:
+            continue
+
+        x_scale = entry["rect"].width / entry["crop"].width
+        for line in entry["layout"]:
+            for word in line["words"]:
+                measured_width = font_classifier.measure_width(
+                    word["text"],
+                    word["choice"],
+                    1.0,
+                )
+                source_width = (word["right"] - word["left"]) * x_scale
+                sizes.append(source_width / max(measured_width, 1e-6))
+
+    if not sizes:
+        return None
+
+    return max(4.0, min(12.0, float(np.median(sizes))))
+
+
+def _line_width_at_one(words, font_classifier):
+    width = 0.0
+    for index, word in enumerate(words):
+        choice = word["choice"]
+        width += font_classifier.measure_width(word["text"], choice, 1.0)
+        if index < len(words) - 1:
+            width += font_classifier.measure_width(" ", choice, 1.0)
+    return width
+
+
+def _insert_source_layout(
+    page,
+    rect,
+    crop,
+    layout,
+    kind,
+    font_classifier,
+    body_font_size,
+):
+    x_scale = rect.width / crop.width
+    y_scale = rect.height / crop.height
+    median_line_height = float(
+        np.median([line["bottom"] - line["top"] for line in layout])
+    )
+
+    for line in layout:
+        words = line["words"]
+        target_width = (line["right"] - line["left"]) * x_scale
+        width_at_one = _line_width_at_one(words, font_classifier)
+
+        if kind == "text" and body_font_size is not None:
+            font_size = body_font_size
+        else:
+            height_size = median_line_height * y_scale * 1.5
+            width_size = target_width / max(width_at_one, 1e-6)
+            font_size = max(4.0, min(24.0, height_size, width_size))
+        first_choice = words[0]["choice"]
+        baseline = (
+            rect.y0
+            + line["bottom"] * y_scale
+            + first_choice.measure_font.descender * font_size
+        )
+        text_widths, natural_spaces = _word_and_space_widths(
+            words,
+            font_size,
+            font_classifier,
+        )
+        natural_width = sum(text_widths) + sum(natural_spaces)
+        if natural_width > target_width:
+            font_size *= target_width / natural_width
+            text_widths, natural_spaces = _word_and_space_widths(
+                words,
+                font_size,
+                font_classifier,
+            )
+
+        if natural_spaces:
+            extra_space = max(
+                0.0,
+                target_width - sum(text_widths) - sum(natural_spaces),
+            ) / len(natural_spaces)
+            spaces = [width + extra_space for width in natural_spaces]
+        else:
+            spaces = []
+
+        x = rect.x0 + line["left"] * x_scale
+        for index, (word, text_width) in enumerate(zip(words, text_widths)):
+            choice = word["choice"]
+            visible_text = word["text"]
+            if index < len(words) - 1:
+                visible_text += " "
+            page.insert_text(
+                (x, baseline),
+                visible_text,
+                fontsize=font_size,
+                **font_classifier.insert_kwargs(choice),
+                color=(0, 0, 0),
+            )
+            x += text_width
+            if index < len(spaces):
+                x += spaces[index]
+
+
+def _word_and_space_widths(words, font_size, font_classifier):
+    text_widths = []
+    spaces = []
+    for index, word in enumerate(words):
+        choice = word["choice"]
+        text_widths.append(
+            font_classifier.measure_width(word["text"], choice, font_size)
+        )
+        if index < len(words) - 1:
+            spaces.append(font_classifier.measure_width(" ", choice, font_size))
+    return text_widths, spaces
+
+
+def _insert_text_fallback(page, rect, text, crop, kind, font_classifier):
     if kind == "title":
         base_choice = font_classifier.choices["bold"]
     else:
         base_choice = font_classifier.classify(crop)
     font_size, lines = _fit_lines(text, rect, base_choice, kind, font_classifier)
-    line_crops = _line_crops_from_image(crop, len(lines))
-    line_choices = _line_font_choices(font_classifier, line_crops, base_choice, len(lines), kind)
-
     y = rect.y0 + font_size
 
-    for line, choice in zip(lines, line_choices):
-        x = rect.x0
+    for line in lines:
         page.insert_text(
-            (x, y),
+            (rect.x0, y),
             line,
             fontsize=font_size,
-            **font_classifier.insert_kwargs(choice),
+            **font_classifier.insert_kwargs(base_choice),
             color=(0, 0, 0),
         )
         y += _line_height(font_size)
-
-
-def _line_font_choices(font_classifier, line_crops, base_choice, line_count, kind):
-    if line_crops is None:
-        return [base_choice] * line_count
-
-    choices = [font_classifier.classify(line_crop) for line_crop in line_crops]
-    if kind == "text" and line_count > 1:
-        return _smooth_multiline_text_choices(font_classifier, choices)
-
-    italic_count = sum(choice.style in ("italic", "bold_italic") for choice in choices)
-    if (
-        line_count > 2
-        and base_choice.style in ("regular", "bold")
-        and italic_count / line_count > 0.4
-    ):
-        return [base_choice] * line_count
-
-    return choices
-
-
-def _smooth_multiline_text_choices(font_classifier, choices):
-    counts = {}
-    for choice in choices:
-        counts[choice.style] = counts.get(choice.style, 0) + 1
-
-    style, count = max(counts.items(), key=lambda item: item[1])
-    share = count / len(choices)
-    if style == "regular" or share >= 0.75:
-        return [font_classifier.choices[style]] * len(choices)
-
-    return [font_classifier.choices["regular"]] * len(choices)
 
 
 def _fit_lines(text, rect, base_choice, kind, font_classifier):
@@ -216,69 +684,6 @@ def _wrap_text_for_width(text, max_width, font_choice, font_size, font_classifie
 
     lines.append(line)
     return lines
-
-
-def _line_crops_from_image(crop, expected_count):
-    if expected_count <= 1:
-        return [crop]
-
-    gray = ImageOps.grayscale(crop)
-    gray = ImageOps.autocontrast(gray)
-    array = np.asarray(gray, dtype=np.uint8)
-    threshold = min(235, max(35, int(array.mean() - array.std() * 0.15)))
-    ink = array < threshold
-    row_counts = ink.sum(axis=1)
-    if int(row_counts.max()) <= 0:
-        return None
-
-    active = row_counts > max(2, row_counts.max() * 0.08)
-    active = _dilate_rows(active, 2)
-    bands = _row_bands(active)
-    bands = [(top, bottom) for top, bottom in bands if bottom - top >= 2]
-    bands = _merge_bands_to_count(bands, expected_count)
-
-    if len(bands) != expected_count:
-        return None
-
-    return [crop.crop((0, top, crop.width, bottom)) for top, bottom in bands]
-
-
-def _dilate_rows(active, radius):
-    result = active.copy()
-    for offset in range(1, radius + 1):
-        result[offset:] |= active[:-offset]
-        result[:-offset] |= active[offset:]
-    return result
-
-
-def _row_bands(active):
-    bands = []
-    start = None
-
-    for index, value in enumerate(active):
-        if value and start is None:
-            start = index
-        elif not value and start is not None:
-            bands.append((start, index))
-            start = None
-
-    if start is not None:
-        bands.append((start, len(active)))
-
-    return bands
-
-
-def _merge_bands_to_count(bands, expected_count):
-    bands = list(bands)
-    while len(bands) > expected_count:
-        gaps = [
-            (bands[index + 1][0] - bands[index][1], index)
-            for index in range(len(bands) - 1)
-        ]
-        _gap, index = min(gaps)
-        merged = (bands[index][0], bands[index + 1][1])
-        bands = bands[:index] + [merged] + bands[index + 2 :]
-    return bands
 
 
 def _crop_source_region(source_image, bbox):

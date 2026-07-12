@@ -1,7 +1,9 @@
 from dataclasses import dataclass
 from pathlib import Path
 import random
+import string
 
+import cv2
 import fitz
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
@@ -11,7 +13,7 @@ import torch.nn.functional as F
 
 
 FONT_DIR = Path(r"C:\Windows\Fonts")
-CACHE_VERSION = "v2"
+CACHE_VERSION = "v3"
 CACHE_PATH = (
     Path(__file__).with_name("__pycache__")
     / f"bookscribe_font_classifier_{CACHE_VERSION}.pt"
@@ -19,18 +21,23 @@ CACHE_PATH = (
 IMAGE_WIDTH = 128
 IMAGE_HEIGHT = 64
 IMAGE_PADDING = 4
-TRAINING_SIZES = (16, 20, 24, 30, 38, 48)
-TRAINING_AUGMENTATIONS = 4
+TRAINING_SIZES = (16, 22, 30, 40)
+TRAINING_AUGMENTATIONS = 1
 TRAINING_EPOCHS = 20
-TRAINING_BATCH_SIZE = 128
+TRAINING_BATCH_SIZE = 256
 TRAINING_LEARNING_RATE = 0.001
 RANDOM_SEED = 1337
 STYLES = ("regular", "bold", "italic", "bold_italic")
-STYLE_LABELS = {style: index for index, style in enumerate(STYLES)}
-CONFIDENCE_FLOOR = 0.55
-ITALIC_CONFIDENCE_FLOOR = 0.72
-ITALIC_MARGIN_FLOOR = 0.16
+STYLE_ATTRIBUTES = {
+    "regular": (0.0, 0.0),
+    "bold": (1.0, 0.0),
+    "italic": (0.0, 1.0),
+    "bold_italic": (1.0, 1.0),
+}
 DESKEW_ANGLES = (-3.0, -2.25, -1.5, -0.75, 0.0, 0.75, 1.5, 2.25, 3.0)
+SLANT_SHEAR_MIN = 0.075
+SLANT_SHEAR_MAX = 0.36
+SLANT_GAIN_MIN = 1.15
 
 TRAINING_TEXTS = (
     "The quick brown fox jumps over the lazy dog",
@@ -60,6 +67,17 @@ class FontChoice:
     measure_font: fitz.Font
 
 
+@dataclass(frozen=True)
+class FontEvidence:
+    bold_probability: float
+    italic_probability: float
+    slant_shear: float
+    slant_gain: float
+    stroke_mean: float
+    stroke_p90: float
+    ink_ratio: float
+
+
 class FontClassifier:
     def __init__(self, family="times"):
         if family != "times":
@@ -73,23 +91,71 @@ class FontClassifier:
         self._train_model()
 
     def classify(self, image):
+        bold_probability, italic_probability = self.predict_attributes(image)
+        style = _style_from_attributes(
+            bold_probability >= 0.5,
+            italic_probability >= 0.5,
+        )
+        return self.choices[style]
+
+    def predict_attributes(self, image):
         tensor = _image_tensor(image)
         if tensor is None:
-            return self.choices["regular"]
+            return 0.0, 0.0
 
         with torch.no_grad():
             logits = self._model(tensor.unsqueeze(0).to(self._device))
-            probabilities = F.softmax(logits, dim=1).squeeze(0).cpu()
+            probabilities = torch.sigmoid(logits).squeeze(0).cpu()
 
-        confidence, label = torch.max(probabilities, dim=0)
-        sorted_probabilities = torch.sort(probabilities, descending=True).values
-        margin = float(sorted_probabilities[0] - sorted_probabilities[1])
-        style = STYLES[int(label)]
+        return float(probabilities[0]), float(probabilities[1])
 
-        if _too_uncertain(style, float(confidence), margin):
-            style = "regular"
+    def classify_word_groups(self, word_groups, kinds):
+        evidence_groups = [
+            [self._word_evidence(image) for image in images]
+            for images in word_groups
+        ]
+        styles = [
+            ["bold" if kind == "title" else "regular"] * len(evidences)
+            for evidences, kind in zip(evidence_groups, kinds)
+        ]
+        for group_index, (evidences, kind) in enumerate(zip(evidence_groups, kinds)):
+            if kind == "title":
+                _classify_title_group(styles[group_index], evidences)
+                continue
 
-        return self.choices[style]
+            candidates = [_is_slanted(evidence) for evidence in evidences]
+            candidates = _fill_single_false_gaps(candidates)
+            candidates = _extend_runs_from_cnn(candidates, evidences)
+            candidates = _fill_single_false_gaps(candidates)
+
+            for start, end in _true_runs(candidates):
+                if end - start < 2:
+                    continue
+
+                for word_index in range(start, end):
+                    styles[group_index][word_index] = "italic"
+                prefix_length = _bold_italic_prefix_length(evidences[start:end])
+                for word_index in range(start, start + prefix_length):
+                    styles[group_index][word_index] = "bold_italic"
+
+        return [
+            [self.choices[style] for style in group_styles]
+            for group_styles in styles
+        ]
+
+    def _word_evidence(self, image):
+        bold_probability, italic_probability = self.predict_attributes(image)
+        slant_shear, slant_gain = _slant_evidence(image)
+        stroke_mean, stroke_p90, ink_ratio = _stroke_evidence(image)
+        return FontEvidence(
+            bold_probability=bold_probability,
+            italic_probability=italic_probability,
+            slant_shear=slant_shear,
+            slant_gain=slant_gain,
+            stroke_mean=stroke_mean,
+            stroke_p90=stroke_p90,
+            ink_ratio=ink_ratio,
+        )
 
     def measure_width(self, text, choice, font_size):
         return choice.measure_font.text_length(text, fontsize=font_size)
@@ -124,7 +190,10 @@ class FontClassifier:
             for start in range(0, len(labels), TRAINING_BATCH_SIZE):
                 batch_indices = permutation[start : start + TRAINING_BATCH_SIZE]
                 logits = self._model(images[batch_indices])
-                loss = F.cross_entropy(logits, labels[batch_indices])
+                loss = F.binary_cross_entropy_with_logits(
+                    logits,
+                    labels[batch_indices],
+                )
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -151,7 +220,7 @@ class _FontStyleNet(nn.Module):
             nn.ReLU(),
             nn.AdaptiveAvgPool2d((1, 1)),
         )
-        self.classifier = nn.Linear(48, len(STYLES))
+        self.classifier = nn.Linear(48, 2)
 
     def forward(self, inputs):
         features = self.features(inputs)
@@ -165,10 +234,10 @@ def _training_dataset():
 
     for font_set in _training_font_sets():
         for style, font_path in font_set.items():
-            label = STYLE_LABELS[style]
+            label = STYLE_ATTRIBUTES[style]
             for size in TRAINING_SIZES:
                 font = ImageFont.truetype(str(font_path), size=size)
-                for text in TRAINING_TEXTS:
+                for text in _training_words():
                     for _ in range(TRAINING_AUGMENTATIONS):
                         image = _render_training_text(text, font, style, rng)
                         tensor = _image_tensor(image)
@@ -179,7 +248,25 @@ def _training_dataset():
     if not images:
         raise RuntimeError("No font training samples could be generated.")
 
-    return torch.stack(images), torch.tensor(labels, dtype=torch.long)
+    return torch.stack(images), torch.tensor(labels, dtype=torch.float32)
+
+
+def _training_words():
+    words = [
+        word.strip(string.punctuation)
+        for text in TRAINING_TEXTS
+        for word in text.split()
+    ]
+    rng = random.Random(RANDOM_SEED)
+
+    for _ in range(160):
+        length = rng.randint(2, 14)
+        word = "".join(rng.choice(string.ascii_letters) for _ in range(length))
+        if rng.random() < 0.25:
+            word += rng.choice((",", ".", ":", ";", "-93"))
+        words.append(word)
+
+    return tuple(dict.fromkeys(word for word in words if word))
 
 
 def _training_font_sets():
@@ -261,6 +348,23 @@ def _render_training_text(text, font, style, rng):
     image = Image.new("L", (width, height), background)
     draw = ImageDraw.Draw(image)
     draw.text((12 - left, 12 - top), text, fill=ink, font=font)
+
+    if rng.random() < 0.35:
+        scale = rng.uniform(0.55, 0.9)
+        reduced = image.resize(
+            (
+                max(1, int(round(image.width * scale))),
+                max(1, int(round(image.height * scale))),
+            ),
+            Image.Resampling.BILINEAR,
+        )
+        image = reduced.resize(image.size, Image.Resampling.BILINEAR)
+
+    morphology_roll = rng.random()
+    if morphology_roll < 0.28:
+        image = image.filter(ImageFilter.MinFilter(3))
+    elif morphology_roll < 0.42:
+        image = image.filter(ImageFilter.MaxFilter(3))
 
     if rng.random() < 0.7:
         image = image.rotate(rng.uniform(-1.2, 1.2), expand=True, fillcolor=background)
@@ -402,11 +506,147 @@ def _ink_mask(gray):
     return array < threshold
 
 
-def _too_uncertain(style, confidence, margin):
-    if confidence < CONFIDENCE_FLOOR:
-        return True
+def _style_from_attributes(is_bold, is_italic):
+    if is_bold and is_italic:
+        return "bold_italic"
+    if is_bold:
+        return "bold"
+    if is_italic:
+        return "italic"
+    return "regular"
 
-    if style in ("italic", "bold_italic"):
-        return confidence < ITALIC_CONFIDENCE_FLOOR or margin < ITALIC_MARGIN_FLOOR
 
-    return False
+def _is_slanted(evidence):
+    return (
+        evidence.ink_ratio >= 0.15
+        and SLANT_SHEAR_MIN <= evidence.slant_shear <= SLANT_SHEAR_MAX
+        and evidence.slant_gain >= SLANT_GAIN_MIN
+    )
+
+
+def _classify_title_group(styles, evidences):
+    if not evidences:
+        return
+
+    is_italic = max(evidence.italic_probability for evidence in evidences) >= 0.9
+    if not is_italic:
+        return
+
+    mean_bold = sum(evidence.bold_probability for evidence in evidences) / len(evidences)
+    style = "bold_italic" if mean_bold >= 0.8 else "italic"
+    for index in range(len(styles)):
+        styles[index] = style
+
+
+def _fill_single_false_gaps(values):
+    result = list(values)
+    for index in range(1, len(values) - 1):
+        if not values[index] and values[index - 1] and values[index + 1]:
+            result[index] = True
+    return result
+
+
+def _extend_runs_from_cnn(values, evidences):
+    result = list(values)
+    for start, end in _true_runs(values):
+        if end - start < 2 or start == 0:
+            continue
+        previous = evidences[start - 1]
+        if previous.italic_probability >= 0.7 or (
+            previous.ink_ratio >= 0.15 and previous.slant_gain >= 1.05
+        ):
+            result[start - 1] = True
+    return result
+
+
+def _true_runs(values):
+    runs = []
+    start = None
+
+    for index, value in enumerate(values):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            runs.append((start, index))
+            start = None
+
+    if start is not None:
+        runs.append((start, len(values)))
+
+    return runs
+
+
+def _bold_italic_prefix_length(evidences):
+    if len(evidences) < 4:
+        return 0
+
+    stroke_means = np.asarray(
+        [evidence.stroke_mean for evidence in evidences],
+        dtype=np.float32,
+    )
+    drops = stroke_means[:-1] - stroke_means[1:]
+    if len(drops) > 1:
+        drops = drops[:-1]
+    largest_drop = float(drops.max()) if len(drops) else 0.0
+    if largest_drop < 0.025:
+        return 0
+
+    near_largest = np.nonzero(drops >= largest_drop - 0.01)[0]
+    return int(near_largest[-1]) + 1
+
+
+def _stroke_evidence(image):
+    gray = np.asarray(ImageOps.autocontrast(ImageOps.grayscale(image)), dtype=np.uint8)
+    _threshold, mask = cv2.threshold(
+        gray,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )
+    distances = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    ink_distances = distances[mask > 0]
+    if not len(ink_distances):
+        return 0.0, 0.0, 0.0
+
+    return (
+        float(ink_distances.mean()),
+        float(np.quantile(ink_distances, 0.9)),
+        float((mask > 0).mean()),
+    )
+
+
+def _slant_evidence(image):
+    gray = np.asarray(ImageOps.autocontrast(ImageOps.grayscale(image)), dtype=np.uint8)
+    _threshold, mask = cv2.threshold(
+        gray,
+        0,
+        1,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )
+    height, width = mask.shape
+    if height < 4 or width < 2 or not int(mask.sum()):
+        return 0.0, 1.0
+
+    scores = []
+    for shear in np.linspace(-0.4, 0.4, 33):
+        extra_width = int(round(abs(shear) * height)) + 4
+        transform = np.float32(
+            [
+                [1.0, shear, extra_width / 2.0],
+                [0.0, 1.0, 2.0],
+            ]
+        )
+        transformed = cv2.warpAffine(
+            mask,
+            transform,
+            (width + extra_width, height + 4),
+            flags=cv2.INTER_NEAREST,
+            borderValue=0,
+        )
+        column_counts = transformed.sum(axis=0).astype(np.float32)
+        score = float(column_counts.var() / max(1.0, column_counts.mean()))
+        scores.append((float(shear), score))
+
+    best_shear, best_score = max(scores, key=lambda item: item[1])
+    zero_score = min(scores, key=lambda item: abs(item[0]))[1]
+    return best_shear, best_score / max(zero_score, 1e-6)

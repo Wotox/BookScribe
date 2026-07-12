@@ -12,6 +12,7 @@ requests
 tqdm
 surya-ocr
 easyocr
+opencv-python-headless
 PyMuPDF
 Pillow
 numpy

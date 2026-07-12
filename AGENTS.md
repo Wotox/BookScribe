@@ -10,7 +10,7 @@ The project is split into simple modules:
 main.py        CLI entry point
 pdf_opener.py  Opens PDFs and renders pages as images
 ocr.py         Runs the selected OCR backend on page images
-font_classification.py  Classifies source text crops as regular/bold/italic
+font_classification.py  Classifies source word crops as regular/bold/italic/bold-italic
 pdf_writer.py  Writes recognized text and cropped images into a new PDF
 ```
 
@@ -21,7 +21,11 @@ PyMuPDF is used for both sides of PDF work:
 
 OCR backend details are isolated in `ocr.py` so the rest of the pipeline can stay unchanged.
 
-Font style recovery is isolated in `font_classification.py`. It uses a small CNN trained from local serif book-font samples and caches the trained weights under `__pycache__`; do not reintroduce regex-based author or attribution styling.
+Font style recovery is isolated in `font_classification.py`. It uses a small two-attribute CNN trained from local serif book-font words, plus page-relative slant and stroke calibration, and caches the trained weights under `__pycache__`; do not reintroduce regex-based author or attribution styling.
+
+`pdf_writer.py` segments each Unlimited-OCR text block into source lines and word boxes, aligns OCR tokens in reading order, and renders each word with its visually classified style. Keep mixed styles within a line and preserve the detected source-line position.
+
+Body lines use source-derived font size and justified spacing so their starts and ends match the scan. Keep raster preservation for image-heavy and structurally complex pages where OCR tokens omit visible layout elements.
 
 `OCRReader` should default to `unlimited-ocr` using `baidu/Unlimited-OCR` from Hugging Face. Keep EasyOCR available as the fallback backend via `--ocr-backend easyocr`.
 

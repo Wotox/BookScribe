@@ -23,9 +23,11 @@ From the project folder:
 python .\main.py C:\path\to\file.pdf
 ```
 
-Unlimited-OCR is the default OCR backend. It uses text and image coordinates from the model, classifies visible source text crops with the small CNN in `font_classification.py`, and writes a reconstructed text PDF.
+Unlimited-OCR is the default OCR backend. It uses text and image coordinates from the model, segments source lines into word crops, classifies each word's weight and slant, and writes positioned styled runs into the reconstructed PDF.
 
-The font-style classifier is trained locally from installed serif book fonts and cached under `__pycache__` after the first run. It does not use author-name or attribution regexes.
+Body text keeps the source line breaks, indentation, and justified line width. Image-heavy pages and structured pages whose visual content is not represented by OCR tokens, such as contents pages with leader rules, retain the source page image with an invisible selectable OCR layer.
+
+The font-style CNN is trained locally from installed serif book fonts and cached under `__pycache__` after the first run. Page-relative slant and stroke evidence calibrates the word predictions for scanned ink weight. It does not use author-name or attribution regexes.
 
 To use the older EasyOCR backend:
 
@@ -139,6 +141,7 @@ requests
 tqdm
 surya-ocr
 easyocr
+opencv-python-headless
 PyMuPDF
 Pillow
 numpy
@@ -152,7 +155,7 @@ Note: Unlimited-OCR requires CUDA-enabled PyTorch and downloads `baidu/Unlimited
 main.py        CLI entry point
 pdf_opener.py  Opens PDFs and renders pages as images
 ocr.py         Runs the selected OCR backend on page images
-font_classification.py  Classifies source text crops as regular/bold/italic/bold-italic
+font_classification.py  Classifies source word crops as regular/bold/italic/bold-italic
 pdf_writer.py  Writes recognized text and cropped images into a new PDF
 ```
 

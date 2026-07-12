@@ -103,7 +103,10 @@ Responsibilities:
 
 - Create a new PDF containing selectable text.
 - For Unlimited-OCR, use detected text and image coordinates to place text and cropped image regions.
-- Use `font_classification.py` to choose regular, bold, italic, or bold-italic text style from the source page crop.
+- Segment source lines into words and use `font_classification.py` to choose regular, bold, italic, or bold-italic style for each word.
+- Preserve source line positions and render adjacent words as selectable styled text.
+- Preserve source line widths through source-derived interword spacing instead of reflowing paragraphs.
+- Retain image-heavy or structurally complex source pages as raster pages with an invisible OCR layer when OCR tokens cannot reproduce their visible layout.
 - Keep EasyOCR as a plain text fallback.
 
 Library: PyMuPDF (`fitz`). Use it to create a new PDF, add pages, and insert OCR text directly.
@@ -114,8 +117,9 @@ Font-style classification.
 
 Responsibilities:
 
-- Train a small local CNN from installed serif book-font families and cache the weights after the first run.
-- Classify source text crops as regular, bold, italic, or bold-italic.
+- Train a small local CNN from installed serif book-font words and cache the weights after the first run.
+- Predict bold and italic as independent word attributes, then calibrate them from page-relative slant and stroke evidence.
+- Classify source word crops as regular, bold, italic, or bold-italic.
 - Avoid regex-based attribution or author styling.
 
 ## Output Behavior
