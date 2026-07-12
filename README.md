@@ -2,16 +2,16 @@
 
 BookScribe converts scanned book PDFs into text-based PDFs using OCR.
 
-It is built for plain archive scans: image-only PDFs where each page is a scan of a book page. The output PDF prioritizes selectable, scalable text over preserving the original page layout.
+It is built for plain archive scans: image-only PDFs where each page is a scan of a book page. The default Unlimited-OCR path reconstructs a text PDF using OCR coordinates, cropped image blocks, and visual font-style classification.
 
 ## Current Status
 
-This is an early working version. OCR can be messy, and the generated PDF does not yet recreate the original styling, columns, fonts, or exact page structure.
+This is an early working version. OCR can be messy, and font recovery is approximate because Unlimited-OCR does not report the original font metadata.
 
 The first goal is simple:
 
 ```text
-scanned PDF -> page images -> OCR text -> text-only PDF
+scanned PDF -> page images -> Unlimited-OCR blocks -> font classification -> reconstructed text PDF
 ```
 
 ## Usage
@@ -23,7 +23,11 @@ From the project folder:
 python .\main.py C:\path\to\file.pdf
 ```
 
-Unlimited-OCR is the default OCR backend. To use the older EasyOCR backend:
+Unlimited-OCR is the default OCR backend. It uses text and image coordinates from the model, classifies visible source text crops with the small CNN in `font_classification.py`, and writes a reconstructed text PDF.
+
+The font-style classifier is trained locally from installed serif book fonts and cached under `__pycache__` after the first run. It does not use author-name or attribution regexes.
+
+To use the older EasyOCR backend:
 
 ```powershell
 python .\main.py --ocr-backend easyocr C:\path\to\file.pdf
@@ -44,10 +48,17 @@ On a large GPU, you can also try a larger page chunk:
 python .\main.py --ocr-batch-size 8 C:\path\to\file.pdf
 ```
 
+To test a subset of pages:
+
+```powershell
+python .\main.py C:\path\to\file.pdf --pages 1-20
+```
+
 The output is created next to the input file:
 
 ```text
 <input_file_stem>_text.pdf
+<input_file_stem>_pages_001_020_text.pdf  when --pages 1-20 is used
 ```
 
 ## OCR Comparison
@@ -71,40 +82,6 @@ ocr_comparison\latest_results.md
 ```
 
 That report is grouped by page, then by OCR backend, and includes the exact text each model extracted.
-
-## Unlimited-OCR Layout Reconstruction
-
-To reconstruct pages 1-50 as a text PDF with cropped image blocks and comparison renders:
-
-```powershell
-python .\unlimited_ocr_layout_test.py --pages 1-50 --output-dir .\ocr_comparison\unlimited_ocr_layout_001_050
-```
-
-The script writes stable outputs under:
-
-```text
-ocr_comparison\unlimited_ocr_layout_001_050\
-```
-
-Useful files:
-
-```text
-unlimited_ocr_pages_001_050_text.pdf        reconstructed text PDF
-unlimited_ocr_pages_001_050_text_debug.pdf  reconstructed PDF with visible OCR block boxes
-unlimited-ocr\page_###.md                   raw UnlimitedOCR output
-blocks\page_###.json                        parsed block type, bbox, and text
-images\page_###_image_##.png                cropped image regions
-original_pages\page_###.png                 rendered source scan pages
-reconstructed_pages\page_###.png            rendered reconstructed pages
-comparison\page_###.png                     side-by-side original and reconstructed pages
-```
-
-The script is resumable: existing `unlimited-ocr\page_###.md` files are reused unless `--force-ocr` is passed.
-To rebuild from another existing OCR output folder:
-
-```powershell
-python .\unlimited_ocr_layout_test.py --pages 1-50 --output-dir .\ocr_comparison\unlimited_ocr_layout_001_050 --ocr-text-dir .\ocr_comparison\20260630_131948\unlimited-ocr
-```
 
 Backends currently included:
 
@@ -163,6 +140,7 @@ tqdm
 surya-ocr
 easyocr
 PyMuPDF
+Pillow
 numpy
 ```
 
@@ -174,7 +152,8 @@ Note: Unlimited-OCR requires CUDA-enabled PyTorch and downloads `baidu/Unlimited
 main.py        CLI entry point
 pdf_opener.py  Opens PDFs and renders pages as images
 ocr.py         Runs the selected OCR backend on page images
-pdf_writer.py  Writes recognized text into a new PDF
+font_classification.py  Classifies source text crops as regular/bold/italic/bold-italic
+pdf_writer.py  Writes recognized text and cropped images into a new PDF
 ```
 
 ## Limitations

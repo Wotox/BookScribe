@@ -13,4 +13,5 @@ tqdm
 surya-ocr
 easyocr
 PyMuPDF
+Pillow
 numpy

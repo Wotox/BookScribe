@@ -41,6 +41,7 @@ BookScribe/
   main.py
   pdf_opener.py
   ocr.py
+  font_classification.py  Classifies source text crops as regular/bold/italic/bold-italic
   pdf_writer.py
   PROJECT_SPEC.md
   requirements.txt
@@ -101,11 +102,21 @@ Text PDF creation.
 Responsibilities:
 
 - Create a new PDF containing selectable text.
-- Add one output page per source page.
-- Write OCR text with readable margins and font size.
-- Handle long text by wrapping lines and continuing onto additional pages if needed.
+- For Unlimited-OCR, use detected text and image coordinates to place text and cropped image regions.
+- Use `font_classification.py` to choose regular, bold, italic, or bold-italic text style from the source page crop.
+- Keep EasyOCR as a plain text fallback.
 
 Library: PyMuPDF (`fitz`). Use it to create a new PDF, add pages, and insert OCR text directly.
+
+### `font_classification.py`
+
+Font-style classification.
+
+Responsibilities:
+
+- Train a small local CNN from installed serif book-font families and cache the weights after the first run.
+- Classify source text crops as regular, bold, italic, or bold-italic.
+- Avoid regex-based attribution or author styling.
 
 ## Output Behavior
 
