@@ -106,7 +106,8 @@ Responsibilities:
 - Segment source lines into words and use `font_classification.py` to choose regular, bold, italic, or bold-italic style for each word.
 - Preserve source line positions and render adjacent words as selectable styled text.
 - Preserve source line widths through source-derived interword spacing instead of reflowing paragraphs.
-- Retain image-heavy or structurally complex source pages as raster pages with an invisible OCR layer when OCR tokens cannot reproduce their visible layout.
+- Reconstruct detected image blocks normally and preserve unconsumed visual components inside text regions as transparent residual overlays.
+- Use full-page raster preservation only for low-text color pages where reconstruction would discard most of the visible page.
 - Keep EasyOCR as a plain text fallback.
 
 Library: PyMuPDF (`fitz`). Use it to create a new PDF, add pages, and insert OCR text directly.
