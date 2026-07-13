@@ -25,7 +25,7 @@ Font style recovery is isolated in `font_classification.py`. It uses a small two
 
 `pdf_writer.py` segments each Unlimited-OCR text block into source lines and word boxes, aligns OCR tokens in reading order, and renders each word with its visually classified style. Keep mixed styles within a line and preserve the detected source-line position.
 
-Body lines use source-derived font size and justified spacing so their starts and ends match the scan. Keep raster preservation for image-heavy and structurally complex pages where OCR tokens omit visible layout elements.
+Body lines use source-derived font size and justified spacing so their starts and ends match the scan. Reconstruct detected image blocks normally. Preserve source ink groups that cannot be aligned to OCR tokens as transparent residual graphics; reserve full-page raster preservation for low-text color pages.
 
 `OCRReader` should default to `unlimited-ocr` using `baidu/Unlimited-OCR` from Hugging Face. Keep EasyOCR available as the fallback backend via `--ocr-backend easyocr`.
 

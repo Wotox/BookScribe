@@ -1,4 +1,5 @@
 import io
+from itertools import combinations
 import math
 from pathlib import Path
 import textwrap
@@ -204,24 +205,7 @@ def _should_preserve_source_page(source_image, blocks):
     if word_count <= 20 and colorful_fraction > 0.2:
         return True
 
-    image_fraction = sum(
-        max(0.0, block["bbox"][2] - block["bbox"][0])
-        * max(0.0, block["bbox"][3] - block["bbox"][1])
-        / (COORD_SIZE * COORD_SIZE)
-        for block in blocks
-        if block["kind"] == "image"
-    )
-    if word_count <= 100 and image_fraction >= 0.25:
-        return True
-
-    short_wide_lines = sum(
-        1
-        for block in blocks
-        if block["kind"] == "text"
-        and block["bbox"][2] - block["bbox"][0] >= COORD_SIZE * 0.6
-        and 2 <= len(block["text"].split()) <= 12
-    )
-    return short_wide_lines >= 6
+    return False
 
 
 def _insert_invisible_text_blocks(page, blocks):
@@ -258,12 +242,30 @@ def _source_text_layout(crop, text):
     for line, target_count in zip(lines, target_counts):
         line_tokens = tokens[token_index : token_index + target_count]
         token_index += target_count
-        word_bands = _word_bands_for_tokens(line["glyph_bands"], line_tokens)
+        aligned = _split_attached_residuals(
+            line["initial_words"],
+            line["glyph_bands"],
+            line["bottom"] - line["top"],
+            line_tokens,
+        )
+        if aligned is None:
+            aligned = _align_initial_word_groups(
+                line["initial_words"],
+                line["glyph_bands"],
+                line["bottom"] - line["top"],
+                line_tokens,
+            )
+        if aligned is None:
+            word_bands = _word_bands_for_tokens(line["glyph_bands"], line_tokens)
+            residual_bands = []
+        else:
+            word_bands, residual_bands = aligned
         if len(word_bands) != len(line_tokens):
             return None
 
         line["left"] = word_bands[0][0]
         line["right"] = word_bands[-1][1]
+        line["residual_bands"] = residual_bands
         line["words"] = []
         for token, (left, right) in zip(line_tokens, word_bands):
             padding = 2
@@ -319,11 +321,133 @@ def _source_line_regions(crop):
                 "top": top,
                 "bottom": bottom,
                 "glyph_bands": glyph_bands,
+                "initial_words": initial_words,
                 "initial_count": len(initial_words),
             }
         )
 
     return ink, lines
+
+
+def _align_initial_word_groups(groups, glyph_bands, line_height, tokens):
+    if len(groups) <= len(tokens) or len(groups) - len(tokens) > 4:
+        return None
+    if len(tokens) > 20:
+        return None
+
+    expected_widths = [
+        max(ALIGNMENT_FONT.text_length(token, fontsize=1.0), 1e-6)
+        for token in tokens
+    ]
+    best = None
+    for selected_indices in combinations(range(len(groups)), len(tokens)):
+        ratios = np.asarray(
+            [
+                (groups[group_index][1] - groups[group_index][0]) / expected_width
+                for group_index, expected_width in zip(
+                    selected_indices,
+                    expected_widths,
+                )
+            ],
+            dtype=np.float32,
+        )
+        cost = float(np.log(ratios).std())
+        if best is None or cost < best[0]:
+            best = (cost, selected_indices)
+
+    if best is None or best[0] > 0.45:
+        return None
+
+    selected = set(best[1])
+    word_bands = [groups[index] for index in best[1]]
+    residual_bands = [
+        group
+        for index, group in enumerate(groups)
+        if index not in selected
+    ]
+    if not all(
+        _is_visual_residual(group, glyph_bands, line_height)
+        for group in residual_bands
+    ):
+        return None
+    return word_bands, residual_bands
+
+
+def _split_attached_residuals(groups, glyph_bands, line_height, tokens):
+    if len(groups) != len(tokens) or len(tokens) < 2:
+        return None
+
+    expected_widths = np.asarray(
+        [
+            max(ALIGNMENT_FONT.text_length(token, fontsize=1.0), 1e-6)
+            for token in tokens
+        ],
+        dtype=np.float32,
+    )
+    observed_widths = np.asarray(
+        [right - left for left, right in groups],
+        dtype=np.float32,
+    )
+    ratios = observed_widths / expected_widths
+    median_ratio = float(np.median(ratios))
+    outliers = np.nonzero(ratios > median_ratio * 2.2)[0]
+    if len(outliers) != 1:
+        return None
+
+    index = int(outliers[0])
+    left, right = groups[index]
+    expected_end = left + expected_widths[index] * median_ratio
+    contained = [
+        band
+        for band in glyph_bands
+        if left <= band[0] and band[1] <= right
+    ]
+    if len(contained) < 2:
+        return None
+
+    split_index = min(
+        range(len(contained) - 1),
+        key=lambda candidate: abs(contained[candidate][1] - expected_end),
+    )
+    word_band = (left, contained[split_index][1])
+    residual_band = (contained[split_index + 1][0], right)
+    if residual_band[1] - residual_band[0] <= word_band[1] - word_band[0]:
+        return None
+    if not _is_visual_residual(residual_band, glyph_bands, line_height):
+        return None
+
+    word_bands = list(groups)
+    word_bands[index] = word_band
+    return word_bands, [residual_band]
+
+
+def _is_visual_residual(region, glyph_bands, line_height):
+    left, right = region
+    contained = [
+        band
+        for band in glyph_bands
+        if left <= band[0] and band[1] <= right
+    ]
+    region_width = right - left
+    if len(contained) == 1:
+        return region_width >= line_height * 8
+    if len(contained) < 5 or region_width < line_height * 4:
+        return False
+
+    widths = np.asarray(
+        [band[1] - band[0] for band in contained],
+        dtype=np.float32,
+    )
+    gaps = np.asarray(
+        [
+            contained[index + 1][0] - contained[index][1]
+            for index in range(len(contained) - 1)
+        ],
+        dtype=np.float32,
+    )
+    width_cv = float(widths.std() / max(widths.mean(), 1e-6))
+    gap_cv = float(gaps.std() / max(gaps.mean(), 1e-6))
+    return width_cv <= 0.45 and gap_cv <= 0.8
 
 
 def _target_line_word_counts(lines, tokens):
@@ -558,6 +682,10 @@ def _insert_source_layout(
 ):
     x_scale = rect.width / crop.width
     y_scale = rect.height / crop.height
+    residual_image = _layout_residual_image(crop, layout)
+    if residual_image is not None:
+        page.insert_image(rect, stream=_image_bytes(residual_image), overlay=True)
+
     median_line_height = float(
         np.median([line["bottom"] - line["top"] for line in layout])
     )
@@ -602,12 +730,15 @@ def _insert_source_layout(
         else:
             spaces = []
 
+        use_source_positions = bool(line.get("residual_bands"))
         x = rect.x0 + line["left"] * x_scale
         for index, (word, text_width) in enumerate(zip(words, text_widths)):
             choice = word["choice"]
             visible_text = word["text"]
             if index < len(words) - 1:
                 visible_text += " "
+            if use_source_positions:
+                x = rect.x0 + word["left"] * x_scale
             page.insert_text(
                 (x, baseline),
                 visible_text,
@@ -616,8 +747,33 @@ def _insert_source_layout(
                 color=(0, 0, 0),
             )
             x += text_width
-            if index < len(spaces):
+            if not use_source_positions and index < len(spaces):
                 x += spaces[index]
+
+
+def _layout_residual_image(crop, layout):
+    residual_regions = [
+        (line["top"], line["bottom"], left, right)
+        for line in layout
+        for left, right in line.get("residual_bands", [])
+    ]
+    if not residual_regions:
+        return None
+
+    gray = np.asarray(ImageOps.grayscale(crop), dtype=np.uint8)
+    alpha = np.zeros_like(gray, dtype=np.uint8)
+    source_alpha = np.where(gray < 180, 255 - gray, 0).astype(np.uint8)
+    for top, bottom, left, right in residual_regions:
+        padding = 2
+        y0 = max(0, top - padding)
+        y1 = min(crop.height, bottom + padding)
+        x0 = max(0, left - padding)
+        x1 = min(crop.width, right + padding)
+        alpha[y0:y1, x0:x1] = source_alpha[y0:y1, x0:x1]
+
+    rgba = np.zeros((crop.height, crop.width, 4), dtype=np.uint8)
+    rgba[:, :, 3] = alpha
+    return Image.fromarray(rgba, mode="RGBA")
 
 
 def _word_and_space_widths(words, font_size, font_classifier):

@@ -25,7 +25,7 @@ python .\main.py C:\path\to\file.pdf
 
 Unlimited-OCR is the default OCR backend. It uses text and image coordinates from the model, segments source lines into word crops, classifies each word's weight and slant, and writes positioned styled runs into the reconstructed PDF.
 
-Body text keeps the source line breaks, indentation, and justified line width. Image-heavy pages and structured pages whose visual content is not represented by OCR tokens, such as contents pages with leader rules, retain the source page image with an invisible selectable OCR layer.
+Body text keeps the source line breaks, indentation, and justified line width. Image blocks are reconstructed from their detected crops. When source text regions contain ink groups that OCR did not consume, those residual graphics are overlaid at their original coordinates instead of preserving the whole page.
 
 The font-style CNN is trained locally from installed serif book fonts and cached under `__pycache__` after the first run. Page-relative slant and stroke evidence calibrates the word predictions for scanned ink weight. It does not use author-name or attribution regexes.
 
